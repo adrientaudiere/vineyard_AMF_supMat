@@ -1,0 +1,2558 @@
+---
+title: "Supplementary Report S2. Report with ASV without OTU post-clustering. Terroir and farming practices drive arbuscular mycorrhizal fungal communities in French vineyard."
+format:
+  html:   
+    page-layout: full
+    theme: 
+      - flatly
+    dark: darkly
+    fontsize: 0.9em
+    code-fold: true
+    toc: true
+    embed-resources: true
+    toc-depth: 5
+---
+  
+```{r}
+#| message: false
+library(targets)
+library(MiscMetabar)
+library(metacoder)
+library(DT)
+library(knitr)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+library(FactoMineR)
+library(factoextra)
+library(DESeq2)
+library(indicspecies)
+library(sf)
+library(adespatial)
+library(ade4)
+library(adegraphics)
+library(kableExtra)
+library(formattable)
+library(microbiomeMarker)
+library(ComplexUpset)
+library(tidyverse)
+library(gt)
+
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::lag)
+```
+
+```{r, echo=FALSE}
+#' @title Update sample_data slot of a phyloseq-class object
+#' @description
+#'
+#' <a href="https://adrientaudiere.github.io/MiscMetabar/articles/Rules.html#lifecycle">
+#' <img src="https://img.shields.io/badge/lifecycle-experimental-orange" alt="lifecycle-experimental"></a>
+#'
+#'
+#' @inheritParams clean_pq
+#' @param df_info : A dataframe with rownames matching for sample names of the
+#'   phyloseq object
+#' @param overwrite (logical, default FALSE): if TRUE, column present in the
+#' @param filter_samples (logical, default FALSE): if TRUE, only samples names
+#' present in the phyloseq object are used.
+#' @param keep_sample_names (logical, default FALSE): if TRUE, a column named
+#'   'Sample_names_joined' is add to the sam_data
+#' @return A phyloseq object with an updated sam_data slot
+#' @export
+#'
+#' @examples
+#'
+#' data_fungi <- add_info_to_sam_data(data_fungi)
+#' summary(data_fungi@sam_data$Time)
+#' new_df <- data.frame(
+#'   variable_1 = runif(n = nsamples(data_fungi), min = 1, max = 20),
+#'   Time = runif(n = nsamples(data_fungi), min = 1, max = 2)
+#' )
+#' rownames(new_df) <- sample_names(data_fungi)
+#'
+#' data_fungi2 <- update_sam_data(data_fungi, new_df)
+#' summary(data_fungi2@sam_data$Time.first_v)
+#' summary(data_fungi2@sam_data$Time.second_v)
+#' plot(data_fungi2@sam_data$nb_otu ~ data_fungi2@sam_data$variable_1)
+#'
+#' data_fungi_3 <- update_sam_data(data_fungi, new_df, overwrite=TRUE)
+#' summary(data_fungi_3@sam_data$Time)
+#'
+#' # Must throw an error
+#' # update_sam_data(data_fungi2, new_df)
+#'
+#' new_df2 <- data.frame(
+#'   variable_1 = runif(n = nsamples(data_fungi)+1, min = 1, max = 20),
+#'   Time = runif(n = nsamples(data_fungi)+1, min = 1, max = 2)
+#' )
+#' rownames(new_df2) <- c("sample_not_in_pq", sample_names(data_fungi))
+#'
+#' # Must throw an error
+#' # update_sam_data(data_fungi, new_df2)
+#'
+#' update_sam_data(data_fungi, new_df2, filter_samples = TRUE)
+#' @author Adrien Taudière
+
+update_sam_data <- function(physeq,
+                            df_info = NULL,
+                            overwrite = FALSE,
+                            filter_samples = FALSE,
+                            keep_sample_names=FALSE) {
+  # if (is.null(df_info)) {
+  #   stop("df_info parameter must be set")
+  # }
+  
+  if (sum(sample_names(physeq) %in% rownames(df_info)) == 0) {
+    stop("Rownames of df_info must match the sample names of physeq.")
+  }
+  
+  if (sum(grepl(".first_v", colnames(physeq@sam_data))) > 0 ||
+      sum(grepl(".second_v", colnames(physeq@sam_data))) > 0) {
+    stop(
+      "At least one of your colnames already contains a column including
+         `.first_v` or `.second_v` text in it. It problably comes from a
+         precedent called to update_sam_data() function. Please rename column(s)
+         before to update sample data."
+    )
+  }
+  
+  df_info <- rownames_to_column(df_info, var = "Sample_names_joined")
+  if (filter_samples) {
+    df_info <- df_info |>
+      filter(Sample_names_joined %in% sample_names(physeq))
+  }
+  
+  if (sum(df_info$Sample_names_joined %in% sample_names(physeq)) == 0) {
+    stop("Rownames of df_info must match the sample names of physeq. 
+         You may try option filter_samples = TRUE.")
+  }
+  
+  new_physeq <- physeq
+  sam_df <- as_tibble(new_physeq@sam_data)
+  sam_df$Sample_names_joined <- sample_names(physeq)
+  
+  new_sam_df <- left_join(sam_df,
+                          df_info,
+                          by = "Sample_names_joined",
+                          suffix = c(".first_v", ".second_v"),)
+  
+  if (overwrite) {
+    new_sam_df <-
+      new_sam_df |>
+      select(-ends_with(".first_v")) |>
+      rename_with(function(x) {
+        gsub(".second_v", "", x)
+      }, ends_with(".second_v"))
+  }
+  
+  if(!keep_sample_names) {
+    new_sam_df <-
+      new_sam_df |>
+      select(-Sample_names_joined)
+  }
+  
+  new_physeq@sam_data <- sample_data(new_sam_df)
+  new_physeq <- clean_pq(new_physeq, silent = TRUE)
+  verify_pq(new_physeq)
+  
+  return(new_physeq)
+}
+```
+
+```{r}
+d_asv_blast <- tar_read(d_blast)
+d_asv <- tar_read(data_phyloseq_PR2)
+
+sam_data_updated <- read.delim("data/samples_data/sam_data_english.csv")
+rownames(sam_data_updated) <- sam_data_updated[,1]
+d_asv_blast <- update_sam_data(d_asv_blast, sam_data_updated, overwrite = TRUE)
+d_asv <- update_sam_data(d_asv, sam_data_updated, overwrite = TRUE)
+```
+
+```{r}
+d <- d_asv_blast
+d <- clean_pq(d, verbose = TRUE, force_taxa_as_columns = TRUE)
+taxa_names(d) <- paste0("OTU_", seq_along(taxa_names(d)))
+```
+
+## Metadata modification
+
+### Spores number
+
+```{r}
+d@sam_data$nb_spores <- rowMeans(cbind(as.numeric(d@sam_data$spores_rep1), as.numeric(d@sam_data$spores_rep2),as.numeric(d@sam_data$spores_rep3)),na.rm=TRUE)
+```
+
+### Practices
+
+```{r}
+d@sam_data$organic <- ifelse(!d@sam_data$practice %in%
+                               c("Conventional", "Conversion"),
+                             "Organic", "NonOrganic"
+)
+```
+
+### Paired samples (roots, spores from the same samples)
+
+```{r}
+d@sam_data$paired_name <-
+  apply(as.matrix(d@sam_data[, c(5:16)]), 1, paste,
+        collapse = "--"
+  )
+d@sam_data$paired_name[d@sam_data$terroir == "Vergèze"] <-
+  gsub("R", "", d@sam_data$ref_mycea[d@sam_data$terroir == "Vergèze"])
+```
+
+```{r}
+tib_sam_data <- as_tibble(d@sam_data) %>%
+  mutate(across(starts_with("Myc_freq"), as.numeric)) %>%
+  mutate(across(starts_with("Myc_intensity_colonization"), as.numeric)) %>%
+  mutate(across(starts_with("Myc_intensity_root"), as.numeric)) %>%
+  mutate(across(starts_with("Arbuscul_richness"), as.numeric)) %>%
+  mutate(across(starts_with("Arbuscul_abundance"), as.numeric)) %>%
+  mutate(across(starts_with("Vesicle_richness"), as.numeric)) %>%
+  mutate(across(starts_with("Vesicle_abundance"), as.numeric)) %>%
+  mutate(Myc_freq = rowMeans(select(., starts_with("Myc_freq")), na.rm = TRUE)) %>%
+  mutate(Myc_intensity_colonization = rowMeans(select(
+    ., starts_with("Myc_intensity_colonization")
+  ), na.rm = TRUE)) %>%
+  mutate(Myc_intensity_root = rowMeans(select(., starts_with(
+    "Myc_intensity_root"
+  )), na.rm = TRUE)) %>%
+  mutate(Arbuscul_richness = rowMeans(select(., starts_with(
+    "Arbuscul_richness"
+  )), na.rm = TRUE)) %>%
+  mutate(Arbuscul_abundance = rowMeans(select(., starts_with(
+    "Arbuscul_abundance"
+  )), na.rm = TRUE)) %>%
+  mutate(Vesicle_richness = rowMeans(
+    select(., starts_with(
+      "Vesicle_richness"
+    )),
+    na.rm = TRUE
+  )) %>%
+  mutate(Vesicle_abundance = rowMeans(
+    select(., starts_with(
+      "Vesicle_abundance"
+    )),
+    na.rm = TRUE
+  )) %>% tibble::column_to_rownames(var = "X")
+
+sample_data(d) <- tib_sam_data
+```
+
+## Exclude Mycelium
+
+```{r}
+d <- clean_pq(subset_samples(d, compartment != "Mycelium"))
+d_asv <- clean_pq(subset_samples(d_asv, compartment != "Mycelium"))
+```
+
+## Verify number of sequences per samples
+
+```{r}
+#| fig-cap: "Number of sequences per samples (all Phyla)"
+hist(log10(sample_sums(d_asv)), breaks = 40)
+summary(sample_sums(d_asv))
+sd(sample_sums(d_asv))
+```
+
+The samples with the lower nb of total sequences is 21MET828 (2856 seq.)
+but it contains only AMF sequences. So we keep all samples.
+
+```{r}
+#| fig-cap: "Number of sequences per samples (AMF only)"
+hist(log10(sample_sums(d)), breaks = 40)
+summary(sample_sums(d))
+sd(sample_sums(d))
+```
+
+## Summary of final dataset
+
+```{r}
+summary_plot_pq(d) +
+  labs(title = "Summary of final dataset") +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, color = "#1e2b4c"))
+```
+
+## Summary of bioinformatics pipeline
+
+### Global summary
+
+```{r, results='asis'}
+kable(tar_read(track_sequences_samples_clusters))
+```
+
+<!-- ———————————————————————————————————————— -->
+  <!-- ———————————————————————————————————————— -->
+  # TAXONOMICAL ANALYSES
+  <!-- ———————————————————————————————————————— -->
+  <!-- ———————————————————————————————————————— -->
+  
+```{r}
+# Fig S9
+multitax_bar_pq(d_asv, "Supergroup_PR2",
+                "Subdivision_PR2", "Class_PR2",
+                nb_seq = TRUE
+) +
+  ggtitle("Number of sequences (log10) including non-Mucoromycota")
+
+multitax_bar_pq(d_asv, "Supergroup_PR2",
+                "Subdivision_PR2", "Class_PR2",
+                nb_seq = FALSE,
+                log10trans = FALSE
+) +
+  ggtitle("Number of OTUs including non-Mucoromycota")
+
+# VALUE
+seq_mucoromycota <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Mucoromycota")], na.rm = T)
+asv_mucoromycota <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Mucoromycota")] > 0, na.rm = T)
+
+seq_arthropoda <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Arthropoda")], na.rm = T)
+asv_arthropoda <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Arthropoda")] > 0, na.rm = T)
+
+seq_chelicerata <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Order_PR2"] ==
+                                            "Chelicerata")], na.rm = T)
+asv_chelicerata <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Order_PR2"] ==
+                                            "Chelicerata")] > 0, na.rm = T)
+
+seq_nematoda <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Nematoda")], na.rm = T)
+asv_nematoda <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Nematoda")] > 0, na.rm = T)
+
+seq_annelida <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Annelida")], na.rm = T)
+asv_annelida <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Annelida")] > 0, na.rm = T)
+
+seq_tardigrada <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Tardigrada")], na.rm = T)
+asv_tardigrada <-
+  sum(taxa_sums(d_asv@otu_table)[as.vector(d_asv@tax_table[, "Class_PR2"] ==
+                                            "Tardigrada")] > 0, na.rm = T)
+
+df <- data.frame(
+  "Class" = c(
+    "All Taxa",
+    "Mucoromycota",
+    "Arthropoda",
+    "including Chelicerata Order",
+    "Nematoda",
+    "Annelida",
+    "Tardigrada"
+  ),
+  "nb_seq" = c(
+    sum(d_asv@otu_table),
+    seq_mucoromycota,
+    seq_arthropoda,
+    seq_chelicerata,
+    seq_nematoda,
+    seq_annelida,
+    seq_tardigrada
+  ),
+  "nb_ASV" = c(
+    ntaxa(d_asv),
+    asv_mucoromycota,
+    asv_arthropoda,
+    asv_chelicerata,
+    asv_nematoda,
+    asv_annelida,
+    asv_tardigrada
+  )
+)
+
+kable(df)
+```
+
+```{r}
+d_muco <- clean_pq(subset_taxa(d, Class_PR2 == "Mucoromycota"))
+d_asv_blast <- clean_pq(subset_taxa(d_asv_blast, Class_PR2 == "Mucoromycota"))
+```
+
+```{r}
+df <- data.frame(
+  "Proportion of sequences" = c(
+    round(
+      sum(d_asv_blast@otu_table) / sum(d_asv@otu_table), 3
+    ),
+    round(
+      sum(d_muco@otu_table) / sum(d_asv@otu_table), 3
+    )
+  ),
+  "Proportion of OTU" = c(
+    round(
+      ntaxa(d_asv_blast) / ntaxa(d_asv), 3
+    ),
+    round(
+      ntaxa(d_muco) / ntaxa(d_asv), 3
+    )
+  )
+)
+
+rownames(df) <- c(
+  "Blast filter on Maarjam",
+  "Add a filter on Mucoromycota family in PR2"
+)
+kable(df)
+```
+
+
+# SUBSETING AND FILTERING DATASET
+
+
+```{r}
+for(i in c(19:46)){
+  d_muco@sam_data[,i] <- as.numeric(unlist(d_muco@sam_data[,i]))
+}
+```
+
+```{r}
+d_roots <- clean_pq(subset_samples(d_muco, compartment == "Roots"))
+d_spores <- clean_pq(subset_samples(d_muco, compartment == "Spores"))
+```
+
+```{r}
+d_rs_merged_samples <- clean_pq(merge_samples2(
+  d_muco,
+  "paired_name",
+  default_fun = 
+    function(x){MiscMetabar::diff_fct_diff_class(x, na.rm=T)}
+))
+```
+
+```{r}
+d_rs <- clean_pq(subset_samples_pq(
+  d_rs_merged_samples,
+  sample_sums(d_rs_merged_samples) > 2000
+))
+# VALUE
+(sort(sample_sums(d_rs_merged_samples)))[1]
+```
+
+After merging soil and root tips paired samples, the minimum nb of
+sequences per samples is `r (sort(sample_sums(d_rs_merged_samples)))[1]`
+
+```{r}
+spores_roots_samples <- sample_names(d_asv_blast)[d_asv_blast@sam_data$compartment!="Mycelium"]
+
+tar_load(derep_fs)
+tar_load(seq_tab_Pairs)
+tar_load(seqtab_wo_chimera)
+tar_load(seqtab)
+tar_load(data_phyloseq_PR2)
+
+# TABLE XXX_pipeline
+tw <- track_wkflow(
+  list(
+    "Raw data" = tar_read(data_raw)$fnfs[grepl(paste(spores_roots_samples, collapse='|'), tar_read(data_raw)$fnfs)],
+    "Quality-filtered data" = derep_fs[grepl(paste(spores_roots_samples, collapse='|'),names(derep_fs))],
+    "Paired denoised sequences (ASV)" = seq_tab_Pairs[grepl(paste(spores_roots_samples, collapse='|'),rownames(seq_tab_Pairs)),colSums(seq_tab_Pairs[grepl(paste(spores_roots_samples, collapse='|'),rownames(seq_tab_Pairs)),])>0],
+    # "ASV without chimera" = seqtab_wo_chimera[grepl(paste(spores_roots_samples, collapse='|'),rownames(seqtab_wo_chimera)),],
+    "ASV without chimera and longer than 200bp" = seqtab[grepl(paste(spores_roots_samples, collapse='|'),rownames(seqtab)),colSums(seqtab[grepl(paste(spores_roots_samples, collapse='|'),rownames(seqtab)),])>0],
+    "OTU after vsearch reclustering at 97%" =clean_pq(subset_samples(tar_read(data_phyloseq_PR2), compartment != "Mycelium")),
+    "Maarjam Filtered" =   clean_pq(subset_samples(tar_read(d_blast), compartment != "Mycelium")),
+    "PR2 Filtered" = d_muco,
+    "Roots only" = d_roots,
+    "Spores only" = d_spores,
+    "Roots + spores merged" = d_rs_merged_samples
+  )
+)
+
+
+colnames(tw) <- c("Sequences", "Clusters", "Samples")
+
+tw <- tw %>% mutate("diff_seq"=Sequences-lag(Sequences)) %>% mutate("diff_cluster"=Clusters-lag(Clusters))
+
+colnames(tw) <- c("Sequences", "Clusters", "Samples", "Diff sequences", "Diff cluster")
+kable(tw)
+```
+
+```{r}
+summary_plot_pq(clean_pq(subset_samples(subset_taxa(tar_read(d_blast), Class_PR2 == "Mucoromycota"), compartment != "Mycelium")))
+```
+
+
+## Zoom on the filtering processes
+
+### Number of sequences
+
+```{r}
+# Fig S7
+dir.create("output/krona")
+krona(
+  d_asv,
+  ranks = c(11:19),
+  "output/krona/OTU_post_clustered_allEuk",
+  name = "OTU_post_clustered_allEuk"
+)
+krona(
+  d,
+  ranks = c(11:19),
+  "output/krona/OTU_filtOnMaarjam_AM",
+  name = "OTU_filtOnMaarjam_AM"
+)
+krona(
+  d_muco,
+  ranks = c(11:19),
+  "output/krona/OTU_filtOnMaarjamAndPr2_AM",
+  name = "OTU_filtOnMaarjamAndPr2_AM"
+)
+merge_krona(
+  c(
+    "output/krona/OTU_post_clustered_allEuk",
+    "output/krona/OTU_filtOnMaarjam_AM",
+    "output/krona/OTU_filtOnMaarjamAndPr2_AM"
+  ),
+  "output/krona/Euk_to_AM_filtering_nb_seq.html"
+)
+```
+
+### Number of OTU
+
+```{r}
+# Fig S8
+krona(
+  d_asv,
+  ranks = c(11:19),
+  "output/krona/OTU_post_clustered_allEuk_Nbotu",
+  name = "OTU_post_clustered_allEuk",
+  nb_seq = F
+)
+krona(
+  d,
+  ranks = c(11:19),
+  "output/krona/OTU_filtOnMaarjam_AM_Nbotu",
+  name = "OTU_filtOnMaarjam_AM",
+  nb_seq = F
+)
+krona(
+  d_muco,
+  ranks = c(11:19),
+  "output/krona/OTU_filtOnMaarjamAndPr2_AM_Nbotu",
+  name = "OTU_filtOnMaarjamAndPr2_AM",
+  nb_seq = F
+)
+merge_krona(
+  c(
+    "output/krona/OTU_post_clustered_allEuk_Nbotu",
+    "output/krona/OTU_filtOnMaarjam_AM_Nbotu",
+    "output/krona/OTU_filtOnMaarjamAndPr2_AM_Nbotu"
+  ),
+  "output/krona/Euk_to_AM_filtering_Nbotu.html"
+)
+```
+
+
+### Taxonomy
+
+```{r}
+table(d_rs@tax_table[,"Family"])
+round(table(d_rs@tax_table[,"Family"])/ntaxa(d_rs)*100,2)
+round(table(d_rs@tax_table[,"Order"])/ntaxa(d_rs)*100,2)
+round(table(d_rs@tax_table[,"Genus"])/ntaxa(d_rs)*100,2)
+sort(round(table(d_rs@tax_table[,"Genus_PR2"])/ntaxa(d_rs)*100,2))
+```
+
+
+```{r}
+sort(round(tapply(taxa_sums(d_rs), d_rs@tax_table[,"Family"], sum)/sum(d_rs@otu_table)*100,2))
+
+sort(round(tapply(taxa_sums(d_rs), d_rs@tax_table[,"Order"], sum)/sum(d_rs@otu_table)*100,2))
+sort(round(tapply(taxa_sums(d_rs), d_rs@tax_table[,"Genus"], sum)/sum(d_rs@otu_table)*100,2))
+sort(round(tapply(taxa_sums(d_rs), d_rs@tax_table[,"Genus_PR2"], sum)/sum(d_rs@otu_table)*100,2))
+
+```
+
+<!-- ———————————————————————————————————————— -->
+<!-- ———————————————————————————————————————— -->
+# NUMBER OF SPORES ANALYSES
+<!-- ———————————————————————————————————————— -->
+<!-- ———————————————————————————————————————— -->
+  
+```{r}
+psm_otu <- psmelt(as_binary_otu_table(d_spores)) |>
+  filter(Abundance > 0) |>
+  group_by(Sample) |>
+  summarise(
+    "Abundance" = sum(Abundance),
+    "region" = region[1],
+    "nb_spores" = nb_spores[1]
+  )
+```
+
+```{r}
+psm_res <- psmelt_samples_pq(d_spores) %>% mutate(nb_spores_log10 = log10(nb_spores))
+```
+
+### Spores count \<-\> Alpha diversity
+
+```{r}
+# Fig S2a
+ggstatsplot::ggscatterstats(psm_res, nb_spores_log10, Abundance, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res, nb_spores_log10, Hill_0, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res, nb_spores_log10, Hill_1, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res, nb_spores_log10, Hill_2, type = "non-parametric")
+```
+
+```{r}
+# Fig S2b
+psm_res_rarefied <- psmelt_samples_pq(rarefy_even_depth(d_spores, rngseed = 221013)) %>% mutate(nb_spores_log10 = log10(nb_spores))
+
+ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Abundance, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Hill_0, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Hill_1, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Hill_2, type = "non-parametric")
+```
+
+### Spores count \<-\> Practice
+
+```{r}
+# Fig S5a
+psm_res |> 
+  mutate(is_organic = practice=="Organic") |>
+  ggstatsplot::ggbetweenstats(is_organic, nb_spores_log10, type = "non-parametric") 
+```
+
+```{r}
+# Fig S5b
+ggstatsplot::ggbetweenstats(psm_res, practice, nb_spores_log10, type = "non-parametric") 
+```
+
+
+### Spores count \<-\> Terroir
+
+```{r}
+# Fig. S4
+ggstatsplot::ggbetweenstats(
+  mutate(psm_res,
+         terroir = reorder(psm_res$terroir, psm_res$nb_spores)
+  ),
+  terroir,
+  nb_spores_log10,
+  type = "non-parametric",
+  centrality.plotting = F,
+  package = "ggthemes",
+  palette = "stata_economist"
+) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+
+
+
+### Spores count \<-\> Mycorrhization rate
+
+```{r}
+ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Myc_freq, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Myc_intensity_colonization, type = "non-parametric") +
+  ggstatsplot::ggscatterstats(psm_res_rarefied, nb_spores_log10, Arbuscul_abundance, type = "non-parametric")
+```
+
+
+# MYCORRHIZATION MEASURE
+
+## Mycorrhization rate \<-\> Alpha diversity
+
+### F = Myc_freq
+
+```{r}
+psm_res <- psmelt_samples_pq(d_rs)
+psm_res_rarefied <- psmelt_samples_pq(rarefy_even_depth(d_rs, rngseed = 221013))
+
+# Fig S3a
+(ggstatsplot::ggscatterstats(psm_res, Myc_freq, Hill_0, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Myc_freq, Hill_1, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Myc_freq, Hill_2, type = "non-parametrique")) /
+  (ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_freq, Hill_0, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_freq, Hill_1, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_freq, Hill_2, type = "non-parametrique"))
+```
+
+### M = Myc_intensity_colonization
+
+```{r}
+# Fig S3b
+(ggstatsplot::ggscatterstats(psm_res, Myc_intensity_colonization, Hill_0, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Myc_intensity_colonization, Hill_1, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Myc_intensity_colonization, Hill_2, type = "non-parametrique")) /
+  (ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_intensity_colonization, Hill_0, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_intensity_colonization, Hill_1, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Myc_intensity_colonization, Hill_2, type = "non-parametrique"))
+```
+
+### A = Arbuscul_abundance
+
+```{r}
+# Fig S3c
+(ggstatsplot::ggscatterstats(psm_res, Arbuscul_abundance , Hill_0, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Arbuscul_abundance, Hill_1, type = "non-parametrique") +
+    ggstatsplot::ggscatterstats(psm_res, Arbuscul_abundance, Hill_2, type = "non-parametrique")) /
+  (ggstatsplot::ggscatterstats(psm_res_rarefied, Arbuscul_abundance, Hill_0, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Arbuscul_abundance, Hill_1, type = "non-parametrique") +
+     ggstatsplot::ggscatterstats(psm_res_rarefied, Arbuscul_abundance, Hill_2, type = "non-parametrique"))
+```
+
+## Mycorrhization rate \<-\> terroir
+
+```{r}
+ggstatsplot::ggbetweenstats(psm_res_rarefied, terroir, Myc_freq, type = "non-parametrique", centrality.plotting = F) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied, terroir, Myc_intensity_colonization, type = "non-parametrique", centrality.plotting = F) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied, terroir, Arbuscul_abundance, type = "non-parametrique", centrality.plotting = F)
+```
+
+```{r}
+kruskal.test(Myc_freq ~ terroir, psm_res_rarefied)
+kruskal.test(Myc_intensity_colonization ~ terroir, psm_res_rarefied)
+kruskal.test(Arbuscul_abundance ~ terroir, psm_res_rarefied)
+```
+
+
+## Mycorrhization rate \<-\> practice
+
+```{r}
+ggstatsplot::ggbetweenstats(psm_res_rarefied, practice, Myc_freq, type = "non-parametrique", centrality.plotting = F) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied, practice, Myc_intensity_colonization, type = "non-parametrique", centrality.plotting = F) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied, practice, Arbuscul_abundance, type = "non-parametrique", centrality.plotting = F)
+```
+
+```{r}
+kruskal.test(Myc_freq ~ practice, psm_res)
+kruskal.test(Myc_intensity_colonization ~ practice, psm_res)
+kruskal.test(Arbuscul_abundance ~ practice, psm_res)
+```
+
+```{r}
+terroir_practice <- interaction(psm_res_rarefied$terroir, psm_res_rarefied$practice)
+kruskal.test(Myc_freq ~ terroir_practice, psm_res_rarefied)
+kruskal.test(Myc_intensity_colonization ~ terroir_practice, psm_res_rarefied)
+kruskal.test(Arbuscul_abundance ~ terroir_practice, psm_res_rarefied)
+```
+
+
+
+# ECOLOGICAL ANALYSES : ALPHA DIVERSITY
+
+## Compartment
+
+```{r}
+psm_res <- psmelt_samples_pq(d_muco)
+psm_res_rarefied <- psmelt_samples_pq(rarefy_even_depth(d_muco, rngseed = 221013))
+```
+
+```{r}
+ggstatsplot::ggbetweenstats(psm_res_rarefied,
+                            compartment,
+                            Hill_0,
+                            type = "non-parametrique"
+) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied,
+                              compartment,
+                              Hill_1,
+                              type = "non-parametrique"
+  ) +
+  ggstatsplot::ggbetweenstats(psm_res_rarefied,
+                              compartment,
+                              Hill_2,
+                              type = "non-parametrique"
+  )
+```
+
+```{r}
+ggplot(psm_res_rarefied, aes(y=Hill_0, x=compartment, color=practice))+
+  geom_point() + 
+  geom_line(aes(group = paired_name)) +
+  facet_wrap(~terroir)
+```
+
+
+## Terroir
+
+```{r}
+psm_res <- psmelt_samples_pq(d_rs)
+psm_res_rarefied <- psmelt_samples_pq(rarefy_even_depth(d_rs, rngseed = 221013))
+```
+
+```{r}
+# Figure S11b
+(ggstatsplot::ggbetweenstats(
+  mutate(
+    psm_res_rarefied,
+    terroir = reorder(psm_res_rarefied$terroir, psm_res_rarefied$Hill_2)
+  ),
+  terroir,
+  Hill_0,
+  type = "non-parametrique",
+  centrality.plotting = F,
+  package = "ggsci",
+  palette = "springfield_simpsons",
+  point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                      0.8, size = 3, stroke = 0, na.rm = TRUE),
+  violin.args = list(width=0),
+  boxplot.args = list(alpha=0, width= 0.5)
+)+ coord_flip()) /
+  (ggstatsplot::ggbetweenstats(
+    mutate(
+      psm_res_rarefied,
+      terroir = reorder(psm_res_rarefied$terroir, psm_res_rarefied$Hill_2)
+    ),
+    terroir,
+    Hill_1,
+    type = "non-parametrique",
+    centrality.plotting = F,
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                        0.8, size = 3, stroke = 0, na.rm = TRUE),
+    violin.args = list(width=0),
+    boxplot.args = list(alpha=0, width= 0.5)
+  )+ coord_flip()) /
+  (ggstatsplot::ggbetweenstats(
+    mutate(
+      psm_res_rarefied,
+      terroir = reorder(psm_res_rarefied$terroir, psm_res_rarefied$Hill_2)
+    ),
+    terroir,
+    Hill_2,
+    type = "non-parametrique",
+    centrality.plotting = F,
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                        0.8, size = 3, stroke = 0, na.rm = TRUE),
+    violin.args = list(width=0),
+    boxplot.args = list(alpha=0, width= 0.5)
+  ) + coord_flip()) + plot_layout(axes = "collect")
+```
+
+
+```{r}
+# Figure S11a
+(ggstatsplot::ggbetweenstats(
+  mutate(
+    psm_res,
+    terroir = reorder(psm_res$terroir, psm_res$Hill_2)
+  ),
+  terroir,
+  Hill_0,
+  type = "non-parametrique",
+  centrality.plotting = F,
+  package = "ggsci",
+  palette = "springfield_simpsons",
+  point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                      0.8, size = 3, stroke = 0, na.rm = TRUE),
+  violin.args = list(width=0),
+  boxplot.args = list(alpha=0, width= 0.5)
+)+ coord_flip()) /
+  (ggstatsplot::ggbetweenstats(
+    mutate(
+      psm_res,
+      terroir = reorder(psm_res$terroir, psm_res$Hill_2)
+    ),
+    terroir,
+    Hill_1,
+    type = "non-parametrique",
+    centrality.plotting = F,
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                        0.8, size = 3, stroke = 0, na.rm = TRUE),
+    violin.args = list(width=0),
+    boxplot.args = list(alpha=0, width= 0.5)
+  )+ coord_flip()) /
+  (ggstatsplot::ggbetweenstats(
+    mutate(
+      psm_res,
+      terroir = reorder(psm_res$terroir, psm_res$Hill_2)
+    ),
+    terroir,
+    Hill_2,
+    type = "non-parametrique",
+    centrality.plotting = F,
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(position = ggplot2::position_jitterdodge(dodge.width = 0.6), alpha =
+                        0.8, size = 3, stroke = 0, na.rm = TRUE),
+    violin.args = list(width=0),
+    boxplot.args = list(alpha=0, width= 0.5)
+  ) + coord_flip()) + plot_layout(axes = "collect")
+```
+
+
+```{r}
+sort(tapply(psm_res_rarefied$Hill_0, psm_res_rarefied$terroir, median))
+sort(tapply(psm_res$Hill_0, psm_res$terroir, median))
+```
+
+
+```{r}
+p_accu_terroir_rarefy <- MiscMetabar::accu_plot(rarefy_even_depth(d_rs, rngseed = 221013), "terroir", by.fact = T, step = 200) + xlim(c(0, 35000))
+
+threshold <- MiscMetabar::accu_samp_threshold(p_accu_terroir_rarefy)
+sort(threshold)
+p_accu_terroir_rarefy
+
+table(d_rs@sam_data$terroir)
+
+tapply(p_accu_terroir_rarefy$data$X1, p_accu_terroir_rarefy$data$fact, max)
+```
+
+
+
+```{r}
+# Fig_7a
+p_accu_balanced_mod_terroir <- 
+  MiscMetabar::accu_plot_balanced_modality(d_rs,
+                                           "terroir", 
+                                           nperm = 999, 
+                                           step = 100,
+                                           quantile_prob=0.9,
+                                           sample.size = 10000)
+
+p_accu_balanced_mod_terroir +
+  xlab("Number of sequences") + 
+  ylab("Number of OTUs") + 
+  ggrepel::geom_label_repel(data=summarise(group_by(p_accu_balanced_mod_terroir$data,factor) ,y=max(X1,na.rm = T)),aes(label=factor,y=y,x=max(p_accu_balanced_mod_terroir$data$x,na.rm = T)), max.overlaps = 1900, force = 20) + xlim(c(1,25000)) + theme(legend.position = "none" )
+```
+
+## Practice
+
+```{r}
+# Figure 4
+ggstatsplot::ggbetweenstats(
+  psm_res_rarefied,
+  practice,
+  Hill_0,
+  centrality.plotting = F,
+  type = "non-parametrique",
+  package = "ggsci",
+  palette = "springfield_simpsons",
+  point.args = list(
+    position = ggplot2::position_jitterdodge(dodge.width = 0.6),
+    alpha =
+      0.8,
+    size = 3,
+    stroke = 0,
+    na.rm = TRUE
+  ), ggplot.component = list(theme(plot.subtitle = element_text(size =5, face = "bold"))),
+  violin.args = list(width = 0),
+  boxplot.args = list(alpha = 0, width = 0.5)
+) + ylab("Hill 0 (richness)") +
+  ggstatsplot::ggbetweenstats(
+    psm_res_rarefied,
+    practice,
+    Hill_1,
+    centrality.plotting = F,
+    type = "non-parametrique",
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(
+      position = ggplot2::position_jitterdodge(dodge.width = 0.6),
+      alpha =
+        0.8,
+      size = 3,
+      stroke = 0,
+      na.rm = TRUE
+    ), ggplot.component = list(theme(plot.subtitle = element_text(size =5, face = "bold"))),
+    violin.args = list(width = 0),
+    boxplot.args = list(alpha = 0, width = 0.5)
+  ) + ylab("Hill 1 (~Shannon)") +
+  ggstatsplot::ggbetweenstats(
+    psm_res_rarefied,
+    practice,
+    Hill_2,
+    centrality.plotting = F,
+    type = "non-parametrique",
+    package = "ggsci",
+    palette = "springfield_simpsons",
+    point.args = list(
+      position = ggplot2::position_jitterdodge(dodge.width = 0.6),
+      alpha =
+        0.8,
+      size = 3,
+      stroke = 0,
+      na.rm = TRUE
+    ), ggplot.component = list(theme(plot.subtitle = element_text(size =5, face = "bold"))),
+    violin.args = list(width = 0),
+    boxplot.args = list(alpha = 0, width = 0.5)
+  ) + ylab("Hill 2 (~Simpson)") +  plot_layout(axes = "collect")
+```
+
+```{r}
+# Figure S11
+(ggstatsplot::ggbetweenstats(psm_res,
+                             practice,
+                             Hill_0,
+                             centrality.plotting = F,
+                             type = "non-parametrique",
+                             violin.args = list(width = 0),
+                             boxplot.args = list(alpha = 0, width = 0.5)
+) + scale_color_manual(values=c("#0970aa9a", "#33bb9ec2", "#779d4aa3")) )/ (ggstatsplot::ggbetweenstats(psm_res,
+                                                                                                        practice,
+                                                                                                        Hill_1,
+                                                                                                        centrality.plotting = F,
+                                                                                                        type = "non-parametrique",
+                                                                                                        violin.args = list(width = 0),
+                                                                                                        boxplot.args = list(alpha = 0, width = 0.5)
+) + scale_color_manual(values=c("#0970aa9a", "#33bb9ec2", "#779d4aa3"))) /
+  ( ggstatsplot::ggbetweenstats(psm_res,
+                                practice,
+                                Hill_2,
+                                centrality.plotting = F,
+                                type = "non-parametrique",
+                                violin.args = list(width = 0),
+                                boxplot.args = list(alpha = 0, width = 0.5)
+  ) + scale_color_manual(values=c("#0970aa9a", "#33bb9ec2", "#779d4aa3")))
+
+
+```
+
+```{r}
+p_accu_practice_rarefy <- MiscMetabar::accu_plot(rarefy_even_depth(d_rs, rngseed = 221013), "practice", by.fact = T, step = 200)
+
+threshold <- MiscMetabar::accu_samp_threshold(p_accu_practice_rarefy)
+sort(threshold)
+p_accu_practice_rarefy
+
+table(d_rs@sam_data$practice)
+
+tapply(p_accu_practice_rarefy$data$X1, p_accu_practice_rarefy$data$fact, max)
+
+
+p_accu_practice_rarefy_after_merging <- MiscMetabar::accu_plot(rarefy_even_depth(merge_samples2(d_rs, "practice"), rngseed = 221013), "practice", step = 200)
+
+(p_accu_practice_rarefy + theme(legend.position = "none") + ylim(c(0, 125))) + (p_accu_practice_rarefy_after_merging + ylim(c(0, 125)))
+
+p_accu_practice_rarefy_after_merging
+```
+
+```{r}
+# Fig_7b
+p_accu_balanced_mod <- 
+  MiscMetabar::accu_plot_balanced_modality(d_rs,
+                                           "practice", 
+                                           nperm = 999, 
+                                           step = 300,
+                                           quantile_prob=0.90)
+
+(p_accu_balanced_mod +
+    xlab("Number of sequences") +
+    ylab("Number of OTUs")+ 
+    ggrepel::geom_label_repel(data=summarise(group_by(p_accu_balanced_mod$data,factor) ,y=max(X1,na.rm = T)),aes(label=factor,y=y,x=max(p_accu_balanced_mod$data$x,na.rm = T)), max.overlaps = 1900, force = 20) + xlim(c(1,18000)) + theme(legend.position = "none" )) +
+  (  p_accu_balanced_mod_terroir +
+       xlab("Number of sequences") + 
+       ylab("Number of OTUs") + 
+       ggrepel::geom_label_repel(data=summarise(group_by(p_accu_balanced_mod_terroir$data,factor) ,y=max(X1,na.rm = T)),aes(label=factor,y=y,x=max(p_accu_balanced_mod_terroir$data$x,na.rm = T)), max.overlaps = 1900, force = 20) + xlim(c(1,25000)) + theme(legend.position = "none" ))
+```
+
+
+## ZOOM ON LOW-DIVERSITY SAMPLES
+
+```{r}
+otu_hill <- vegan::renyi(d_rs@otu_table, scale = c(0, 1, 2), hill = TRUE)
+
+barplot(sort(otu_hill$`0`))
+abline(h = 10)
+barplot(sort(otu_hill$`1`))
+abline(h = 5)
+barplot(sort(otu_hill$`2`))
+abline(h = 5)
+```
+
+```{r}
+low_div_samples <-
+  rownames(otu_hill[
+    otu_hill$`1` < 5 |
+      otu_hill$`2` < 5, ])
+
+low_div_samples
+
+sum(otu_hill$`0` < 10)
+sum(otu_hill$`1` < 5)
+sum(otu_hill$`2` < 5)
+length(low_div_samples)
+```
+
+```{r}
+low_div_samples_table <- tibble(cbind(as_tibble(d_rs@sam_data[low_div_samples, c("terroir", "practice", "rank", "inter_rank", "compartment")]), apply(otu_hill[low_div_samples, ], 2, round, digits = 2), sample_sums(d_rs)[low_div_samples]))
+
+low_div_samples_table$compartment <- ifelse(is.na(low_div_samples_table$compartment), "Spores + Roots", "Spores")
+
+colnames(low_div_samples_table) <- c("Terroir", "Global practice", "Rank practice", "Inter rank practice", "Compartment", "Hill 0 (richness)", "Hill 1 (~Shannon)", "Hill 2 (~Simpson)", "nb_seq")
+
+low_div_samples_table <- arrange(low_div_samples_table, as.numeric(`Hill 0 (richness)`))
+
+low_div_samples_table <-
+  rbind(
+    low_div_samples_table,
+    c(
+      "",
+      "",
+      "",
+      "MEAN",
+      "(low -diversity samples)",
+      round(mean(low_div_samples_table$`Hill 0 (richness)`), 2),
+      round(mean(low_div_samples_table$`Hill 1 (~Shannon)`), 2),
+      round(mean(low_div_samples_table$`Hill 2 (~Simpson)`), 2),
+      round(mean(low_div_samples_table$nb_seq), 2)
+    ),
+    c(
+      "",
+      "",
+      "",
+      "MEAN",
+      "(all samples)",
+      round(mean(otu_hill$`0`), 2),
+      round(mean(otu_hill$`1`), 2),
+      round(mean(otu_hill$`2`), 2),
+      round(mean(sample_sums(d_rs)), 2)
+    ),
+    c(
+      "",
+      "",
+      "",
+      "MAX",
+      "(all samples)",
+      round(max(otu_hill$`0`), 2),
+      round(max(otu_hill$`1`), 2),
+      round(max(otu_hill$`2`), 2),
+      round(max(sample_sums(d_rs)), 2)
+    )
+  )
+
+# Table XXX_low_div_samples
+kbl(low_div_samples_table) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+
+# ECOLOGICAL ANALYSES : BETA DIVERSITY
+
+## Compartment
+
+```{r}
+# Fig S10
+p <- phyloseq::plot_ordination(d_muco,
+                               vegan::decorana(vegdist(as(otu_table(d_muco), "matrix"),
+                                                       method = "robust.aitchison"
+                               )),
+                               color = "region",
+                               shape = "compartment"
+) +
+  geom_point(size = 3) +
+  stat_ellipse(inherit.aes = F, aes(x = DCA1, y = DCA2, linetype = compartment))
+
+p + geom_line(data = p$data, aes(group = paired_name))
+```
+
+
+## Practice and terroir
+
+```{r}
+p <-
+  phyloseq::plot_ordination(d_rs,
+                            ordinate(d_rs,
+                                     method = "NMDS",
+                                     distance = "bray"
+                            ),
+                            color = "terroir",
+                            shape = "practice"
+  ) + facet_wrap("region") + scale_shape_manual(values=c(25,23,24))
+
+p_nmds <- p + geom_point(
+  data = select(p$data, -c(region)),
+  fill = "grey40",
+  color = "grey20",
+  size = 1,
+  alpha = 0.5
+) +
+  geom_point(size = 3, aes(fill=terroir)) +
+  ggtitle("NMDS on bray distance") + 
+  scale_fill_manual(values=c("#5660d0","#de8a00","#b59e00","#00773d","#fcb709",
+                             "#e15968","#784b43","#c200ab","#00b3f0","#953726",
+                             "#e09199","#379d30","#ed5019","#ff63b0")) +
+  scale_color_manual(values=rep("grey20",14))
+
+
+# XXXX_nmds_region_practice_terroir
+p_nmds
+```
+
+```{r}
+p <- phyloseq::plot_ordination(d_rs,
+                               ordinate(d_rs,
+                                        method = "NMDS",
+                                        distance = "bray"
+                               ),
+                               color = "practice"
+) +
+  geom_point(size = 4) + facet_wrap("~terroir")
+
+p + geom_point(
+  data = select(p$data, -c(terroir)),
+  size = 2,
+  alpha = 0.3
+) +
+  geom_point(size = 4) +
+  ggtitle("NMDS on bray distance")
+```
+
+
+```{r}
+# Fig 6a
+upset_pq(d_rs, "practice", taxa_fill = "Family",
+         set_sizes=(
+           upset_set_size()
+           + geom_text(aes(label=after_stat(count)), hjust=-0.3, color="white", stat='count')
+         ))
+ggvenn_pq(d_rs, "practice")
+
+# Fig 6b
+upset_pq(d_rs, "terroir", taxa_fill = "Family", min_size = 2,  height_ratio = 0.6
+         ,set_sizes=(
+           upset_set_size()
+           + geom_label(aes(label=after_stat(count)), hjust=-0.3, size=2.5,  stat='count')
+         ))
+```
+
+## Global beta-div analysis
+
+### Spatial data
+
+```{r}
+library(geodist)
+lat_lon <- as_tibble(d_rs@sam_data[, c("lat", "long")])
+lat_lon$lat <- as.numeric(lat_lon$lat)
+lat_lon$long <- as.numeric(lat_lon$long)
+dist_spatial_meter <- as.dist(geodist(lat_lon, measure = "geodesic"),
+                              upper = FALSE
+)
+```
+
+```{r}
+lon_lat_rs <- d_rs@sam_data[, c("long", "lat")]
+lon_lat_rs$long <- as.numeric(lon_lat_rs$long)
+lon_lat_rs$lat <- as.numeric(lon_lat_rs$lat)
+MEM <- dbmem(lon_lat_rs, MEM.autocor = "non-null")
+```
+
+```{r}
+test_MEM <- moran.randtest(MEM, nrepet = 1999)
+test_MEM$pvalue_adjust <- p.adjust(test_MEM$pvalue, method = "BH")
+test_MEM$pvalue_adjust[test_MEM$pvalue_adjust < 0.05]
+barplot(test_MEM$obs)
+```
+
+```{r}
+d_rs@sam_data$MEM_1 <- MEM[, 1]
+d_rs@sam_data$MEM_2 <- MEM[, 2]
+res_ado_spatial_robAit <- adonis_pq(
+  d_rs,
+  "MEM_1 + MEM_2 + practice + inter_rank + rank  + terroir",
+  correction_for_sample_size = TRUE,
+  dist_method = "robust.aitchison",
+  by = "terms"
+)
+
+res_ado_spatial_robAit_rarefy <- adonis_pq(
+  rarefy_even_depth(d_rs, rngseed = 626),
+  "MEM_1 + MEM_2 + practice + inter_rank + rank  + terroir",
+  correction_for_sample_size = FALSE,
+  dist_method = "robust.aitchison",
+  by = "terms"
+)
+
+res_ado_spatial_bray <- adonis_pq(
+  d_rs,
+  "MEM_1 + MEM_2 + practice + inter_rank + rank  + terroir",
+  correction_for_sample_size = TRUE,
+  dist_method = "bray",
+  by = "terms"
+)
+
+
+res_ado_spatial_bray_rarefy <- adonis_pq(
+  rarefy_even_depth(d_rs, rngseed = 626),
+  "MEM_1 + MEM_2 + practice + inter_rank + rank  + terroir",
+  correction_for_sample_size = FALSE,
+  dist_method = "bray",
+  by = "terms"
+)
+
+df <- data.frame(res_ado_spatial_bray)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "sample_size",
+      "MEM_1",
+      "MEM_2",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+p1 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.01
+  ) +
+  ggtitle("Permanova on Bray")
+
+df <- data.frame(res_ado_spatial_robAit)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+p2 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.01
+  ) +
+  ggtitle("Permanova on robust Aitchison")
+
+df <- data.frame(res_ado_spatial_bray_rarefy)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+
+p3 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.01
+  ) +
+  ggtitle("Permanova on Bray after rarefaction")
+
+df <- data.frame(res_ado_spatial_robAit_rarefy)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+p4 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.01
+  ) +
+  ggtitle("Permanova on robust Aitchison after rarefaction")
+
+(p1 + ylim(0, 0.12) + p2 + ylim(0, 0.12)) /
+  (p3 + ylim(0, 0.12) + p4 + ylim(0, 0.12))
+```
+
+```{r}
+anova(vegan::betadisper(phyloseq::distance(d_rs@otu_table, "bray"), d_rs@sam_data$terroir))
+anova(vegan::betadisper(phyloseq::distance(d_rs@otu_table, "bray"), d_rs@sam_data$practice))
+anova(vegan::betadisper(phyloseq::distance(d_rs@otu_table, "bray"), rarefy_even_depth(d_rs, rngseed = 626)@sam_data$terroir))
+anova(vegan::betadisper(phyloseq::distance(d_rs@otu_table, "bray"), rarefy_even_depth(d_rs, rngseed = 626)@sam_data$practice))
+anova(vegan::betadisper(vegdist(d_rs@otu_table, "robust.aitchison"), d_rs@sam_data$terroir))
+anova(vegan::betadisper(vegdist(d_rs@otu_table, "robust.aitchison"), d_rs@sam_data$practice))
+anova(vegan::betadisper(vegdist(d_rs@otu_table, "robust.aitchison"), rarefy_even_depth(d_rs, rngseed = 626)@sam_data$terroir))
+anova(vegan::betadisper(vegdist(d_rs@otu_table, "robust.aitchison"), rarefy_even_depth(d_rs, rngseed = 626)@sam_data$practice))
+```
+
+
+### Soil properties
+
+```{r}
+soil_prop <- as_tibble(d_rs@sam_data) |>
+  select(paired_name, practice, organic, terroir, Coarse_sand:CEC)
+soil_prop_num <- soil_prop |>
+  select(-all_of(c("practice", "organic", "terroir", "CaO", "Total_sand", "Total_filt"))) |>
+  tibble::column_to_rownames("paired_name") |>
+  mutate(across(everything(), as.numeric)) |>
+  tidyr::drop_na()
+```
+
+```{r}
+#devtools::install_github("arleyc/PCAtest")
+pca_test_res <- PCAtest::PCAtest(soil_prop_num, varcorr = T, plot = F)
+
+pval <- c()
+for (i in seq_len(length(pca_test_res$`Percentage of variation of empirical PC's`))) {
+  obs <- pca_test_res$`Percentage of variation of empirical PC's`[i]
+  null_model <- pca_test_res$`Percentage of variation of randomized data`[, i]
+  
+  pval[i] <- (sum(obs < null_model) + 1) / (1 + nrow(pca_test_res$`Percentage of variation of randomized data`))
+}
+
+pca_test_pval_adj <- p.adjust(pval, method = "BH")
+pca_test_pval_adj
+```
+
+```{r}
+res_pca <- dudi.pca(soil_prop_num, scannf = F, nf = 4)
+```
+
+```{r}
+p_pca_variable <- fviz_pca_var(res_pca,
+                               col.var = "cos2",
+                               gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                               repel = TRUE
+)
+
+p_pca_variable_axe3_4 <- fviz_pca_var(res_pca,
+                                      col.var = "cos2", axes = c(3, 4),
+                                      gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                                      repel = TRUE
+)
+
+res_pca_var <- get_pca_var(res_pca)
+
+# Fig. 2
+(p_pca_variable + p_pca_variable_axe3_4) / free((factoextra::fviz_eig(res_pca)) +
+                                                  (ggcorrplot::ggcorrplot(res_pca_var$cor)))
+```
+
+```{r}
+practice <- unlist(lapply(strsplit(rownames(res_pca$tab), "--"), function(x) {
+  x[6]
+}))
+
+terroir <- unlist(lapply(strsplit(rownames(res_pca$tab), "--"), function(x) {
+  x[3]
+}))
+
+p_pca_ind_terroir <- fviz_pca_ind(res_pca,
+                                  habillage = terroir,
+                                  label = FALSE,
+                                  repel = TRUE,
+                                  mean.point = FALSE,
+                                  addEllipses = TRUE,
+                                  pointsize = 3,
+                                  ellipse.type = "convex"
+) +
+  scale_shape_manual(values = rep(16, length(unique(terroir))))
+
+p_pca_ind_terroir$data$terroir <- terroir
+p_pca_ind_terroir$data$practice <- practice
+
+p_pca_ind_terroir_practice <- p_pca_ind_terroir + geom_point(aes(x = x, y = y),
+                                                             shape = case_when(
+                                                               practice == "Organic" ~ 2,
+                                                               practice == "Conventional" ~ 6,
+                                                               practice == "Conversion" ~ 5
+                                                             ), size = 3.5,
+                                                             color = rgb(0, 0, 0, 0.7)
+)
+
+fviz_pca_var(res_pca)
+
+# value
+kw1_terroir <- kruskal.test(res_pca$tab[, 1], terroir)
+kw2_terroir <- kruskal.test(res_pca$tab[, 2], terroir)
+kw3_terroir <- kruskal.test(res_pca$tab[, 3], terroir)
+
+kw1_practice <- kruskal.test(res_pca$tab[, 1], practice)
+kw2_practice <- kruskal.test(res_pca$tab[, 2], practice)
+kw3_practice <- kruskal.test(res_pca$tab[, 3], practice)
+
+
+# Fig. 3 -> now figure S
+p_pca_ind_terroir_practice + 
+  annotate("text", x = 2, y = 4.5, label = paste("Kruskal-Wallis (axe1 - terroir): pval=", round(as.numeric(kw1_terroir$p.value),4)), size = 3) + 
+  annotate("text", x = 2, y = 4.25, label = paste("Kruskal-Wallis (axe2 - terroir): pval=", round(as.numeric(kw2_terroir$p.value),4)), size = 3) + 
+  annotate("text", x = 2, y = 4, label = paste("Kruskal-Wallis (axe3 - terroir): pval=", round(as.numeric(kw3_terroir$p.value),4)), size = 3) + 
+  annotate("text", x = -2, y = 4.5, label = paste("Kruskal-Wallis (axe1 - practice): pval=", round(as.numeric(kw1_practice$p.value),4)), size = 3) + 
+  annotate("text", x = -2, y = 4.25, label = paste("Kruskal-Wallis (axe2 - practice): pval=", round(as.numeric(kw2_practice$p.value),4)), size = 3) + 
+  annotate("text", x = -2, y = 4, label = paste("Kruskal-Wallis (axe3 - practice): pval=", round(as.numeric(kw3_practice$p.value),4)), size = 3)
+```
+
+
+```{r}
+# Fig. S1
+ggplot(d_rs@sam_data, aes(x = practice, y = as.numeric(Cu), fill = practice)) +
+  geom_violin() +
+  geom_jitter()
+# value
+kruskal.test(as.numeric(d_rs@sam_data$Cu), d_rs@sam_data$practice)
+```
+
+```{r}
+d_with_pca <-
+  clean_pq(subset_samples_pq(d_rs, d_rs@sam_data$paired_name %in% rownames(soil_prop_num)))
+
+res_pca_ind <- get_pca_ind(res_pca)
+
+if (!identical(match(rownames(res_pca_ind$coord), d_with_pca@sam_data$paired_name), sort(match(rownames(res_pca_ind$coord), d_with_pca@sam_data$paired_name)))) {
+  stop("ERROR")
+}
+
+d_with_pca <- add_info_to_sam_data(d_with_pca, res_pca_ind$coord)
+
+cor.test(d_with_pca@sam_data$Dim.1, d_with_pca@sam_data$nb_otu, method = "spearman")
+cor.test(d_with_pca@sam_data$Dim.2, d_with_pca@sam_data$nb_otu, method = "spearman")
+cor.test(d_with_pca@sam_data$Dim.3, d_with_pca@sam_data$nb_otu, method = "spearman")
+
+(ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.1, Hill_0, type = "non-parametric") +
+    ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.1, Hill_1, type = "non-parametric") +
+    ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.1, Hill_2, type = "non-parametric")) /
+  (ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.2, Hill_0, type = "non-parametric") +
+     ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.2, Hill_1, type = "non-parametric") +
+     ggstatsplot::ggscatterstats(psmelt_samples_pq(d_with_pca), Dim.2, Hill_2, type = "non-parametric"))
+```
+
+```{r}
+dim_df <- as_tibble(d_with_pca@sam_data) |>
+  select(c(starts_with("Dim"), "nb_seq", "nb_otu"))
+
+cor_results <- correlation::correlation(dim_df)
+summary(cor_results)
+cor_results %>%
+  summary(redundant = TRUE) %>%
+  plot()
+```
+
+```{r}
+lon_lat_with_pca <- d_with_pca@sam_data[, c("long", "lat")]
+lon_lat_with_pca$long <- as.numeric(lon_lat_with_pca$long)
+lon_lat_with_pca$lat <- as.numeric(lon_lat_with_pca$lat)
+MEM_with_pca <- dbmem(lon_lat_with_pca, MEM.autocor = "non-null")
+
+d_with_pca@sam_data$MEM_1 <- MEM_with_pca[, 1]
+d_with_pca@sam_data$MEM_2 <- MEM_with_pca[, 2]
+```
+
+```{r}
+res_ado_spatial_soil_bray <-
+  adonis_pq(
+    d_with_pca,
+    "MEM_1 + MEM_2 + Dim.1 + Dim.2 + Dim.3 + practice + inter_rank + rank + terroir",
+    correction_for_sample_size = TRUE,
+    by = "terms"
+  )
+res_ado_spatial_soil_robAit <-
+  adonis_pq(
+    d_with_pca,
+    "MEM_1 + MEM_2 + Dim.1 + Dim.2 + Dim.3 + practice + inter_rank + rank + terroir",
+    correction_for_sample_size = TRUE,
+    dist_method = "robust.aitchison",
+    by = "terms"
+  )
+
+res_ado_spatial_soil_bray_rarefy <-
+  adonis_pq(
+    rarefy_even_depth(d_with_pca, rngseed = 626),
+    "MEM_1 + MEM_2 + Dim.1 + Dim.2 + Dim.3 + practice + inter_rank + rank + terroir",
+    correction_for_sample_size = FALSE,
+    by = "terms"
+  )
+res_ado_spatial_soil_robAit_rarefy <-
+  adonis_pq(
+    rarefy_even_depth(d_with_pca, rngseed = 626),
+    "MEM_1 + MEM_2 + Dim.1 + Dim.2 + Dim.3 + practice + inter_rank + rank + terroir",
+    correction_for_sample_size = FALSE,
+    dist_method = "robust.aitchison",
+    by = "terms"
+  )
+
+anova(betadisper(phyloseq::distance(d_rs, method = "bray"), d_rs@sam_data$practice))
+anova(betadisper(phyloseq::distance(d_rs, method = "bray"), d_rs@sam_data$terroir))
+```
+
+```{r}
+res_ado_rarperm <- adonis_rarperm_pq(d_with_pca,
+                                     "MEM_1 + MEM_2 + Dim.1 + Dim.2 + Dim.3 + practice + inter_rank + rank + terroir",
+                                     nperm = 9,by = "terms"
+)
+res_ado_rarperm
+```
+
+```{r}
+df <- data.frame(res_ado_spatial_soil_bray)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "sample_size",
+      "MEM_1",
+      "MEM_2",
+      "Dim.1",
+      "Dim.2",
+      "Dim.3",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+p1 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.02
+  ) +
+  ggtitle("Permanova on bray")
+
+
+
+df <- data.frame(res_ado_spatial_soil_robAit)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "Dim.1",
+      "Dim.2",
+      "Dim.3",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+
+p2 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.02
+  ) +
+  ggtitle("Permanova on robust Aitchison")
+
+
+
+df <- data.frame(res_ado_spatial_soil_bray_rarefy)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "Dim.1",
+      "Dim.2",
+      "Dim.3",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+
+df <- df %>% filter(!names == "Total")
+
+p3 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.02
+  ) +
+  ggtitle("Permanova on bray rarefied")
+
+
+
+
+df <- data.frame(res_ado_spatial_soil_robAit_rarefy)
+df$names <-
+  factor(
+    rownames(df),
+    levels = c(
+      "MEM_1",
+      "MEM_2",
+      "Dim.1",
+      "Dim.2",
+      "Dim.3",
+      "practice",
+      "inter_rank",
+      "rank",
+      "terroir",
+      "Residual",
+      "Total"
+    )
+  )
+df <- df %>% filter(!names == "Total")
+
+p4 <-
+  ggplot(df, aes(y = R2 / Df, x = names, fill = R2 / Df)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  geom_text(
+    label = case_when(
+      df$Pr..F. < 0.001 ~ "***",
+      df$Pr..F. < 0.01 ~ "**",
+      df$Pr..F. < 0.05 ~ "*",
+      df$Pr..F. > 0.05 ~ "ns"
+    ),
+    nudge_y = 0.02
+  ) +
+  ggtitle("Permanova on robust Aitchison rarefied")
+
+(p1 + ylim(c(0, 0.14)) + p2 + ylim(c(0, 0.14))) /
+  (p3 + ylim(c(0, 0.14)) + p4 + ylim(c(0, 0.14)))
+```
+
+```{r}
+# TABLE 2
+kbl(res_ado_spatial_bray) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+kbl(res_ado_spatial_soil_bray) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+```{r}
+# TABLE S4
+kbl(res_ado_spatial_bray_rarefy) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+# TABLE S5
+kbl(res_ado_spatial_soil_bray_rarefy) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+```{r}
+# TABLE S6
+kbl(res_ado_spatial_robAit_rarefy) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+# TABLE S7
+kbl(res_ado_spatial_soil_robAit_rarefy) |>
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+### Variance partitionning
+
+```{r}
+plot_var_part_pq(
+  var_par_pq(
+    physeq = d_with_pca,
+    list_component = list(
+      "Spatial" = c("MEM_1", "MEM_2"),
+      "Soil" = c("Dim.1", "Dim.2", "Dim.3"),
+      "Practice" = c("practice", "inter_rank", "rank"),
+      "Terroir" = c("terroir")
+    )
+  ),
+  show_dbrda_signif = TRUE
+)
+```
+
+```{r}
+# Figure 6a
+res_varpart_rarefy <- var_par_rarperm_pq(
+  physeq = d_with_pca,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Soil" = c("Dim.1", "Dim.2", "Dim.3"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  nperm = 99,
+  dbrda_computation = TRUE
+)
+plot_var_part_pq(res_varpart_rarefy, show_quantiles = FALSE, filter_quantile_zero = TRUE, show_dbrda_signif = F,digits = 2)
+plot_var_part_pq(res_varpart_rarefy, show_quantiles = TRUE, show_dbrda_signif = TRUE)
+```
+
+```{r}
+# Figure 6b
+res_varpart_rarefy_wo_soil <- var_par_rarperm_pq(
+  physeq = d_rs,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  nperm = 99,
+  dbrda_computation = TRUE
+)
+
+plot_var_part_pq(res_varpart_rarefy_wo_soil, show_quantiles = FALSE, filter_quantile_zero = TRUE, show_dbrda_signif = F,digits = 2)
+```
+
+
+```{r}
+plot_var_part_pq(var_par_pq(
+  physeq = d_with_pca,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Soil" = c("Dim.1", "Dim.2", "Dim.3"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  dist_method = "robust.aitchison"
+))
+
+
+res_varpart_robAit_rarefy <- var_par_rarperm_pq(
+  physeq = d_with_pca,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Soil" = c("Dim.1", "Dim.2", "Dim.3"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  dist_method = "robust.aitchison",
+  nperm = 99
+)
+plot_var_part_pq(res_varpart_robAit_rarefy, filter_quantile_zero = TRUE)
+
+res_varpart_rarefy_wo_soil_Aitchison <- var_par_rarperm_pq(
+  physeq = d_rs,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  dist_method = "robust.aitchison",
+  nperm = 99,
+  dbrda_computation = TRUE
+)
+
+plot_var_part_pq(res_varpart_rarefy_wo_soil_Aitchison, show_quantiles = FALSE, filter_quantile_zero = TRUE, show_dbrda_signif = F,digits = 2)
+```
+
+```{r}
+res_varpart_rarefy <- var_par_rarperm_pq(
+  physeq = d_with_pca,
+  list_component = list(
+    "Spatial" = c("MEM_1", "MEM_2"),
+    "Soil" = c("Dim.1", "Dim.2", "Dim.3"),
+    "Practice" = c("practice", "inter_rank", "rank"),
+    "Terroir" = c("terroir")
+  ),
+  nperm = 99
+)
+plot_var_part_pq(res_varpart_rarefy, show_quantiles = FALSE, filter_quantile_zero = TRUE)
+plot_var_part_pq(res_varpart_rarefy, show_quantiles = TRUE)
+```
+
+
+## New table for resubmission
+
+### Terroir
+
+```{r}
+tab_summary <- d_rs@sam_data |>
+  cbind(vegan::renyi(d_rs@otu_table, scales = c(0, 1, 2), hill = TRUE)) |>
+  as_tibble() |>
+  rename("Hill_0" = "0",
+         "Hill_1" = "1",
+         "Hill_2" = "2") |>
+  group_by(terroir) |>
+  summarise(
+    "mean" = across(
+      c(
+        "Myc_freq",
+        "Myc_intensity_colonization",
+        "Arbuscul_abundance",
+        "Hill_0",
+        "Hill_1",
+        "Hill_2",
+        "Coarse_sand",
+        "Fine_sand",
+        "Coarse_silt",
+        "Fine_silt",
+        "Total_clay",
+        "Total_lime",
+        "ph",
+        "C",
+        "SOM",
+        "N",
+        "C_N",
+        "Cu",
+        "P2O5",
+        "MgO",
+        "K20",
+        "Na20",
+        "CEC",
+        "nb_spores"
+      ),
+      \(x) mean(x, na.rm =TRUE)
+    ),
+    "sd" = across(
+      c(
+        "Myc_freq",
+        "Myc_intensity_colonization",
+        "Arbuscul_abundance",
+        "Hill_0",
+        "Hill_1",
+        "Hill_2",
+        "Coarse_sand",
+        "Fine_sand",
+        "Coarse_silt",
+        "Fine_silt",
+        "Total_clay",
+        "Total_lime",
+        "ph",
+        "C",
+        "SOM",
+        "N",
+        "C_N",
+        "Cu",
+        "P2O5",
+        "MgO",
+        "K20",
+        "Na20",
+        "CEC",
+        "nb_spores"
+      ),
+      \(x) sd(x, na.rm =TRUE)
+    ),
+    "n" = across(c("Myc_freq", "Hill_0", "Fine_sand"), function(x) {
+      sum(!is.na(x))
+    })
+  ) |> 
+  unnest(cols = c(mean, sd, n), names_sep = "_") |>
+  mutate(across(where(is.numeric), function(x) {round(as.numeric(x), 1)})) |>
+  mutate_all(~replace(., is.na(.), NA)) |>
+  relocate(any_of(c("terroir", "n_Myc_freq", "mean_Myc_freq", "mean_Myc_intensity_colonization", "mean_Arbuscul_abundance", "n_Hill_0", "mean_Hill_0", "mean_Hill_1", "mean_Hill_2", "n_Fine_sand")))|>
+  relocate("mean_nb_spores",.after = mean_Arbuscul_abundance)|>
+  relocate("sd_nb_spores",.after = mean_Arbuscul_abundance)
+
+tab_summary_terroir <- tab_summary |>
+  gt() |>
+  cols_width(
+    contains("terroir") ~px(150),
+    starts_with("n") ~ px(30),
+    where(is.numeric) ~ px(65)
+  ) |> 
+  cols_merge(c("mean_Myc_freq", "sd_Myc_freq"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_nb_spores", "sd_nb_spores"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Myc_intensity_colonization", "sd_Myc_intensity_colonization"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Arbuscul_abundance", "sd_Arbuscul_abundance"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>")|> 
+  cols_merge(c("mean_Hill_0", "sd_Hill_0"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Hill_1", "sd_Hill_1"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Hill_2", "sd_Hill_2"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_ph", "sd_ph"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_C", "sd_C"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_SOM", "sd_SOM"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_N", "sd_N"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_C_N", "sd_C_N"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Cu", "sd_Cu"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_P2O5", "sd_P2O5"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Coarse_sand", "sd_Coarse_sand"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Fine_sand", "sd_Fine_sand"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Coarse_silt", "sd_Coarse_silt"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |> 
+  cols_merge(c("mean_Fine_silt", "sd_Fine_silt"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Total_clay", "sd_Total_clay"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Total_lime", "sd_Total_lime"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_MgO", "sd_MgO"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_K20", "sd_K20"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Na20", "sd_Na20"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_CEC", "sd_CEC"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  
+  cols_label(
+    mean_Myc_freq= "F%",
+    mean_Myc_intensity_colonization = "M%",
+    mean_Arbuscul_abundance = "A%",
+    n_Myc_freq = "n",
+    mean_Hill_0 = html("H<sup>0</sup>"),
+    mean_Hill_1 =  html("H<sup>1</sup>"),
+    mean_Hill_2 =  html("H<sup>2</sup>"),
+    n_Hill_0 = "n",
+    n_Fine_sand = "n",
+    mean_ph = "PH",
+    mean_C = "C",
+    mean_SOM ="SOM", 
+    mean_N = "N",
+    mean_C_N = "C/N",
+    mean_Cu = "Cu",
+    mean_P2O5 = "P2O5",
+    mean_Coarse_sand = "Coarse sand",
+    mean_Fine_sand = "Fine sand",
+    mean_Coarse_silt = "Coarse silt",
+    mean_Fine_silt = "Fine silt",
+    mean_Total_clay = "Clay",
+    mean_Total_lime = "Lime",
+    mean_MgO = "MgO",
+    mean_K20 = "K20",
+    mean_Na20 = "Na20",
+    mean_CEC = "CEC",
+    mean_nb_spores = "Spores"
+  )|>
+  tab_spanner(
+    label = "Soil characteristics",
+    columns = -c(terroir, n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, mean_nb_spores, n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )   |>
+  tab_spanner(
+    label = "Fungal colonisation",
+    columns = c(n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, mean_nb_spores)
+  ) |>
+  tab_spanner(
+    label = "Hill number",
+    columns = c(n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )|>
+  opt_stylize(style = 1, color = "gray") |>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_body(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))|>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_column_labels(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))
+
+gtsave(tab_summary_terroir, "tab_summary_terroir.png", vwidth=2200,expand=20)
+```
+
+```{r}
+tab_summary |>
+  gt() |>
+  cols_width(
+    contains("terroir") ~px(150),
+    starts_with("n") ~ px(30),
+    where(is.numeric) ~ px(65)
+  )|>
+  cols_label(
+    mean_Myc_freq= "F%",
+    mean_Myc_intensity_colonization = "M%",
+    mean_Arbuscul_abundance = "A%",
+    n_Myc_freq = "n",
+    mean_Hill_0 = html("H<sup>0</sup>"),
+    mean_Hill_1 =  html("H<sup>1</sup>"),
+    mean_Hill_2 =  html("H<sup>2</sup>"),
+    n_Hill_0 = "n",
+    n_Fine_sand = "n",
+    mean_ph = "PH",
+    mean_C = "C",
+    mean_SOM ="SOM", 
+    mean_N = "N",
+    mean_C_N = "C/N",
+    mean_Cu = "Cu",
+    mean_P2O5 = "P2O5",
+    mean_Coarse_sand = "Coarse sand",
+    mean_Fine_sand = "Fine sand",
+    mean_Coarse_silt = "Coarse silt",
+    mean_Fine_silt = "Fine silt",
+    mean_Total_clay = "Clay",
+    mean_Total_lime = "Lime",
+    mean_MgO = "MgO",
+    mean_K20 = "K20",
+    mean_Na20 = "Na20",
+    mean_CEC = "CEC",
+    mean_nb_spores = "Spores"
+  )|>
+  tab_spanner(
+    label = "Soil characteristics",
+    columns = -c(terroir, n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )   |>
+  tab_spanner(
+    label = "Fungal colonisation",
+    columns = c(n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, mean_nb_spores),
+  ) |>
+  tab_spanner(
+    label = "Hill number",
+    columns = c(n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )|>
+  opt_stylize(style = 1, color = "gray") |>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_body(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))|>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_column_labels(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))
+```
+
+### Practice
+
+```{r}
+tab_summary_p <- d_rs@sam_data |>
+  cbind(vegan::renyi(d_rs@otu_table, scales = c(0, 1, 2), hill = TRUE)) |>
+  as_tibble() |>
+  rename("Hill_0" = "0",
+         "Hill_1" = "1",
+         "Hill_2" = "2") |>
+  group_by(practice) |>
+  summarise(
+    "mean" = across(
+      c(
+        "Myc_freq",
+        "Myc_intensity_colonization",
+        "Arbuscul_abundance",
+        "Hill_0",
+        "Hill_1",
+        "Hill_2",
+        "Coarse_sand",
+        "Fine_sand",
+        "Coarse_silt",
+        "Fine_silt",
+        "Total_clay",
+        "Total_lime",
+        "ph",
+        "C",
+        "SOM",
+        "N",
+        "C_N",
+        "Cu",
+        "P2O5",
+        "MgO",
+        "K20",
+        "Na20",
+        "CEC",
+        "nb_spores"
+      ),
+      \(x) mean(x, na.rm =TRUE)
+    ),
+    "sd" = across(
+      c(
+        "Myc_freq",
+        "Myc_intensity_colonization",
+        "Arbuscul_abundance",
+        "Hill_0",
+        "Hill_1",
+        "Hill_2",
+        "Coarse_sand",
+        "Fine_sand",
+        "Coarse_silt",
+        "Fine_silt",
+        "Total_clay",
+        "Total_lime",
+        "ph",
+        "C",
+        "SOM",
+        "N",
+        "C_N",
+        "Cu",
+        "P2O5",
+        "MgO",
+        "K20",
+        "Na20",
+        "CEC",
+        "nb_spores"
+      ),
+      \(x) sd(x, na.rm =TRUE)
+    ),
+    "n" = across(c("Myc_freq", "Hill_0", "Fine_sand"), function(x) {
+      sum(!is.na(x))
+    })
+  ) |> 
+  unnest(cols = c(mean, sd, n), names_sep = "_") |>
+  mutate(across(where(is.numeric), function(x) {round(as.numeric(x), 1)})) |>
+  mutate_all(~replace(., is.na(.), NA)) |>
+  relocate(any_of(c("practice", "n_Myc_freq", "mean_Myc_freq", "mean_Myc_intensity_colonization", "mean_Arbuscul_abundance", "n_Hill_0", "mean_Hill_0", "mean_Hill_1", "mean_Hill_2", "n_Fine_sand")))|>
+  relocate("mean_nb_spores",.after = mean_Arbuscul_abundance)|>
+  relocate("sd_nb_spores",.after = mean_Arbuscul_abundance)
+
+tab_summary_practice <- tab_summary_p |>
+  gt() |>
+  cols_width(
+    contains("practice") ~px(150),
+    starts_with("n") ~ px(30),
+    where(is.numeric) ~ px(65)
+  ) |> 
+  cols_merge(c("mean_Myc_freq", "sd_Myc_freq"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_nb_spores", "sd_nb_spores"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Myc_intensity_colonization", "sd_Myc_intensity_colonization"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Arbuscul_abundance", "sd_Arbuscul_abundance"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>")|> 
+  cols_merge(c("mean_Hill_0", "sd_Hill_0"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Hill_1", "sd_Hill_1"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Hill_2", "sd_Hill_2"), pattern = "<< {1}  >> <p style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_ph", "sd_ph"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_C", "sd_C"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_SOM", "sd_SOM"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_N", "sd_N"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_C_N", "sd_C_N"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Cu", "sd_Cu"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_P2O5", "sd_P2O5"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Coarse_sand", "sd_Coarse_sand"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Fine_sand", "sd_Fine_sand"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Coarse_silt", "sd_Coarse_silt"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |> 
+  cols_merge(c("mean_Fine_silt", "sd_Fine_silt"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Total_clay", "sd_Total_clay"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Total_lime", "sd_Total_lime"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_MgO", "sd_MgO"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_K20", "sd_K20"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_Na20", "sd_Na20"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  cols_merge(c("mean_CEC", "sd_CEC"), pattern = "<< {1}  >> <p  style='font-size:0.7em'>  << ± {2}>></span> >>") |>
+  
+  cols_label(
+    mean_Myc_freq= "F%",
+    mean_Myc_intensity_colonization = "M%",
+    mean_Arbuscul_abundance = "A%",
+    n_Myc_freq = "n",
+    mean_Hill_0 = html("H<sup>0</sup>"),
+    mean_Hill_1 =  html("H<sup>1</sup>"),
+    mean_Hill_2 =  html("H<sup>2</sup>"),
+    n_Hill_0 = "n",
+    n_Fine_sand = "n",
+    mean_ph = "PH",
+    mean_C = "C",
+    mean_SOM ="SOM", 
+    mean_N = "N",
+    mean_C_N = "C/N",
+    mean_Cu = "Cu",
+    mean_P2O5 = "P2O5",
+    mean_Coarse_sand = "Coarse sand",
+    mean_Fine_sand = "Fine sand",
+    mean_Coarse_silt = "Coarse silt",
+    mean_Fine_silt = "Fine silt",
+    mean_Total_clay = "Clay",
+    mean_Total_lime = "Lime",
+    mean_MgO = "MgO",
+    mean_K20 = "K20",
+    mean_Na20 = "Na20",
+    mean_CEC = "CEC",
+    mean_nb_spores = "Spores"
+  )|>
+  tab_spanner(
+    label = "Soil characteristics",
+    columns = -c(practice, n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, mean_nb_spores, n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )   |>
+  tab_spanner(
+    label = "Fungal colonisation",
+    columns = c(n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, mean_nb_spores)
+  ) |>
+  tab_spanner(
+    label = "Hill number",
+    columns = c(n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )|>
+  opt_stylize(style = 1, color = "gray") |>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_body(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))|>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_column_labels(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))
+
+gtsave(tab_summary_practice, "tab_summary_practice.png", vwidth=2200,expand=20)
+
+
+tab_summary_p |>
+  gt() |>
+  cols_width(
+    contains("practice") ~px(150),
+    starts_with("n") ~ px(30),
+    where(is.numeric) ~ px(65)
+  ) |> 
+  cols_label(
+    mean_Myc_freq= "F%",
+    mean_Myc_intensity_colonization = "M%",
+    mean_Arbuscul_abundance = "A%",
+    n_Myc_freq = "n",
+    mean_Hill_0 = html("H<sup>0</sup>"),
+    mean_Hill_1 =  html("H<sup>1</sup>"),
+    mean_Hill_2 =  html("H<sup>2</sup>"),
+    n_Hill_0 = "n",
+    n_Fine_sand = "n",
+    mean_ph = "PH",
+    mean_C = "C",
+    mean_SOM ="SOM", 
+    mean_N = "N",
+    mean_C_N = "C/N",
+    mean_Cu = "Cu",
+    mean_P2O5 = "P2O5",
+    mean_Coarse_sand = "Coarse sand",
+    mean_Fine_sand = "Fine sand",
+    mean_Coarse_silt = "Coarse silt",
+    mean_Fine_silt = "Fine silt",
+    mean_Total_clay = "Clay",
+    mean_Total_lime = "Lime",
+    mean_MgO = "MgO",
+    mean_K20 = "K20",
+    mean_Na20 = "Na20",
+    mean_CEC = "CEC"
+  )|>
+  tab_spanner(
+    label = "Soil characteristics",
+    columns = -c(practice, n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance, n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )   |>
+  tab_spanner(
+    label = "Fungal colonisation",
+    columns = c(n_Myc_freq, mean_Myc_freq, mean_Myc_intensity_colonization, mean_Arbuscul_abundance),
+  ) |>
+  tab_spanner(
+    label = "Hill number",
+    columns = c(n_Hill_0, mean_Hill_0, mean_Hill_1, mean_Hill_2),
+  )|>
+  opt_stylize(style = 1, color = "gray") |>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_body(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    ))|>
+  tab_style(
+    cell_borders(sides = c("left"), color = "gray", weight= px(1)),
+    cells_column_labels(columns=c(n_Myc_freq, n_Hill_0, n_Fine_sand)
+    )) 
+```
+
+
+
+```{r}
+practice_for_soil_prop <- unlist(lapply(strsplit(rownames(res_pca$tab), "--"), function(x) {
+  x[5]
+}))
+
+```
+
+
+
+## Differential abundance analysis
+
+### Indicspecies
+
+#### Terroir
+
+```{r}
+res_mpt_terroir <-
+  multipatt(as.matrix(d_rs@otu_table),
+            d_rs@sam_data$terroir,
+            control = how(nperm = 9999),
+            max.order = 3
+  )
+
+res_mpt_terroir_df <- res_mpt_terroir$sign
+res_mpt_terroir_df$p.adj <- p.adjust(res_mpt_terroir_df$p.value, method = "BH")
+res_mpt_terroir_df$OTU_names <- rownames(res_mpt_terroir_df)
+res_mpt_terroir_df_signif <-
+  res_mpt_terroir_df %>%
+  filter(p.adj < 0.05) %>%
+  tidyr::pivot_longer(cols = starts_with("s."))
+
+tax_tab <- as.data.frame(d_rs@tax_table)
+tax_tab$otu <- rownames(tax_tab)
+
+res_mpt_terroir_df_signif_taxo <- left_join(res_mpt_terroir_df_signif,tax_tab, by = join_by("OTU_names" == "otu"))
+
+ggplot(
+  res_mpt_terroir_df_signif_taxo,
+  aes(
+    x = OTU_names,
+    y = name,
+    alpha = value,
+    color = Genus_PR2
+  )
+) +
+  geom_point(size = 6) +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  ))+
+  scale_alpha(range = c(0, 1))
+```
+
+```{r}
+res_mpt_terroir_rg <-
+  multipatt(as.matrix(rarefy_even_depth(d_rs, rngseed = 626)@otu_table),
+            d_rs@sam_data$terroir,
+            control = how(nperm = 9999),
+            max.order = 3,
+            func = "r.g"
+  )
+
+res_mpt_terroir_rg_df <- res_mpt_terroir_rg$sign
+res_mpt_terroir_rg_df$p.adj <- p.adjust(res_mpt_terroir_rg_df$p.value, method = "BH")
+res_mpt_terroir_rg_df$OTU_names <- rownames(res_mpt_terroir_rg_df)
+res_mpt_terroir_rg_df_signif <-
+  res_mpt_terroir_rg_df %>%
+  filter(p.adj < 0.05) %>%
+  tidyr::pivot_longer(cols = starts_with("s."))
+
+ggplot(
+  res_mpt_terroir_rg_df_signif,
+  aes(
+    x = OTU_names,
+    y = name,
+    alpha = value,
+    color = stat
+  )
+) +
+  geom_point(size = 4) +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  ))
+```
+
+```{r}
+tapply(d_rs@otu_table[,"OTU_19"] , d_rs@sam_data$terroir, mean)
+tapply(d_rs@otu_table[,"OTU_19"] , d_rs@sam_data$terroir, function(x) {sum(x>0)})
+```
+
+
+#### practice
+
+```{r}
+res_mpt_practice <-
+  multipatt(as.matrix(d_rs@otu_table),
+            d_rs@sam_data$practice,
+            control = how(nperm = 9999),
+            max.order = 3
+  )
+
+res_mpt_practice_df <- res_mpt_practice$sign
+res_mpt_practice_df$p.adj <- p.adjust(res_mpt_practice_df$p.value, method = "BH")
+res_mpt_practice_df$OTU_names <- rownames(res_mpt_practice_df)
+res_mpt_practice_df_signif <-
+  res_mpt_practice_df %>%
+  filter(p.adj < 0.05) %>%
+  tidyr::pivot_longer(cols = starts_with("s."))
+
+ggplot(
+  res_mpt_practice_df_signif,
+  aes(
+    x = OTU_names,
+    y = name,
+    size = 2 * value,
+    color = stat
+  )
+) +
+  geom_point() +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  ))
+```
+
+```{r}
+res_mpt_practice_rg <-
+  multipatt(as.matrix(d_rs@otu_table),
+            d_rs@sam_data$practice,
+            control = how(nperm = 9999),
+            max.order = 3,
+            func = "r.g"
+  )
+
+res_mpt_practice_rg_df <- res_mpt_practice_rg$sign
+res_mpt_practice_rg_df$p.adj <- p.adjust(res_mpt_practice_rg_df$p.value, method = "BH")
+res_mpt_practice_rg_df$OTU_names <- rownames(res_mpt_practice_rg_df)
+res_mpt_practice_rg_df_signif <-
+  res_mpt_practice_rg_df %>%
+  filter(p.adj < 0.05) %>%
+  tidyr::pivot_longer(cols = starts_with("s."))
+
+ggplot(
+  res_mpt_practice_rg_df_signif,
+  aes(
+    x = OTU_names,
+    y = name,
+    size = value,
+    color = stat
+  )
+) +
+  geom_point() +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  ))
+```
+
+
+# Session information
+
+```{r}
+sessionInfo()
+```
